@@ -1,0 +1,890 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Fast 3D FPS Physics (Browser) — Demo</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+  body { margin:0; overflow:hidden; font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial; }
+  #overlay { position: absolute; left: 12px; top: 12px; color: #fff; z-index: 2; }
+  #stamina { width: 220px; height: 14px; background: rgba(255,255,255,0.12); border-radius:6px; overflow:hidden; }
+  #staminaInner { height:100%; background: linear-gradient(90deg,#33cc33,#66ff99); width:100%; transition: width 0.08s linear; }
+  #controls { position: absolute; right: 12px; top: 12px; color: #fff; text-align:right; z-index:2; }
+  canvas { display:block; }
+  .hint { font-size:13px; opacity:0.85; }
+</style>
+</head>
+<body>
+<div id="overlay">
+  <div style="margin-bottom:8px"><strong>Demo physics</strong> — WASD to move, Shift to sprint, Ctrl to crouch, Space to jump</div>
+  <div class="hint">Stamina</div>
+  <div id="stamina"><div id="staminaInner"></div></div>
+</div>
+<div id="controls">
+  <div class="hint">FPS: <span id="fps">0</span></div>
+  <div class="hint">Objects: <span id="count">0</span></div>
+</div>
+
+<!-- load Three.js from CDN for rendering only -->
+<script src="https://unpkg.com/three@0.158.0/build/three.min.js"></script>
+
+<script>
+/*
+  Patched: added player-box (capsule vs box) and robust box-box (OBB vs OBB SAT) collisions.
+  The rest of the engine structure is unchanged — contacts flow into your existing impulse solver.
+*/
+
+let keys = {};
+let mouseDown = false;
+let player;
+let lastTime = 0, accumulator = 0;
+let fpsCounter = {last:0, frames:0};
+
+// -------------------- Utilities --------------------
+const Vec3 = {
+  add: (a,b)=>[a[0]+b[0], a[1]+b[1], a[2]+b[2]],
+  sub: (a,b)=>[a[0]-b[0], a[1]-b[1], a[2]-b[2]],
+  scale: (a,s)=>[a[0]*s, a[1]*s, a[2]*s],
+  dot: (a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2],
+  cross: (a,b)=>[ a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0] ],
+  length: a=>Math.hypot(a[0],a[1],a[2]),
+  normalize: a => { let L=Math.hypot(a[0],a[1],a[2]); return L>0?[a[0]/L,a[1]/L,a[2]/L]:[0,0,0]; }
+};
+
+// Quaternion minimal helpers (w,x,y,z)
+function quatMul(a,b){
+  const [aw,ax,ay,az]=a, [bw,bx,by,bz]=b;
+  return [
+    aw*bw - ax*bx - ay*by - az*bz,
+    aw*bx + ax*bw + ay*bz - az*by,
+    aw*by - ax*bz + ay*bw + az*bx,
+    aw*bz + ax*by - ay*bx + az*bw
+  ];
+}
+function quatNormalize(q){ let n=Math.hypot(q[0],q[1],q[2],q[3]); return n? q.map(v=>v/n):[1,0,0,0]; }
+function quatFromAxisAngle(axis,ang){
+  const na = Vec3.normalize(axis); const s=Math.sin(ang*0.5); return [Math.cos(ang*0.5), na[0]*s, na[1]*s, na[2]*s];
+}
+function quatRotateVec(q,v){
+  // v' = q * (0,v) * q^-1
+  const qw=q[0], qx=q[1], qy=q[2], qz=q[3];
+  const ix =  qw*v[0] + qy*v[2] - qz*v[1];
+  const iy =  qw*v[1] + qz*v[0] - qx*v[2];
+  const iz =  qw*v[2] + qx*v[1] - qy*v[0];
+  const iw = -qx*v[0] - qy*v[1] - qz*v[2];
+  return [
+    ix*qw + iw*-qx + iy*-qz - iz*-qy,
+    iy*qw + iw*-qy + iz*-qx - ix*-qz,
+    iz*qw + iw*-qz + ix*-qy - iy*-qx
+  ];
+}
+
+// Clamp, lerp
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+const lerp = (a,b,t)=>a + (b-a)*t;
+
+// -------------------- Perlin noise (2D) --------------------
+class Perlin {
+  constructor(seed=0){
+    this.perm = new Uint8Array(512);
+    let rng = mulberry32(seed|0);
+    let p = new Uint8Array(256);
+    for(let i=0;i<256;i++) p[i]=i;
+    for(let i=255;i>0;i--){
+      let j = Math.floor(rng()*(i+1));
+      let t = p[i]; p[i]=p[j]; p[j]=t;
+    }
+    for(let i=0;i<512;i++) this.perm[i]=p[i&255];
+  }
+  grad(hash,x,y){
+    const h = hash & 7;
+    const u = h<4?x:y;
+    const v = h<4?y:x;
+    return ((h&1)?-u:u) + ((h&2)?-2.0*v:2.0*v);
+  }
+  noise(x,y){
+    const xi = Math.floor(x) & 255, yi = Math.floor(y) & 255;
+    const xf = x - Math.floor(x), yf = y - Math.floor(y);
+    const u = fade(xf), v = fade(yf);
+    const A  = this.perm[xi] + yi, AA = this.perm[A], AB = this.perm[A+1];
+    const B  = this.perm[xi+1] + yi, BA = this.perm[B], BB = this.perm[B+1];
+    const res = lerp( lerp(this.grad(this.perm[AA], xf, yf),    this.grad(this.perm[BA], xf-1, yf), u),
+                      lerp(this.grad(this.perm[AB], xf, yf-1), this.grad(this.perm[BB], xf-1, yf-1), u),
+                      v );
+    return res * 0.5; // scaled
+  }
+}
+function fade(t){ return t*t*t*(t*(t*6-15)+10); }
+function mulberry32(a){ return function(){ a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a>>>15, 1 | a); t = t + Math.imul(t ^ t>>>7, 61 | t) ^ t; return ((t ^ t>>>14) >>> 0) / 4294967296; } }
+
+// -------------------- Terrain --------------------
+class Terrain {
+  constructor(size=256, scale=1, heightScale=10, seed=1337){
+    this.size = size; this.scale = scale; this.hscale = heightScale;
+    this.noise = new Perlin(seed);
+    this.cache = new Float32Array(size*size);
+    this.generate();
+  }
+  generate(){
+    const s = this.size;
+    const freq = 1/32;
+    for(let x=0;x<s;x++){
+      for(let z=0;z<s;z++){
+        const nx = x * freq, nz = z * freq;
+        let e = 0;
+        e += 1.00 * Math.abs(this.noise.noise(nx, nz));
+        e += 0.50 * Math.abs(this.noise.noise(nx*2, nz*2));
+        e += 0.25 * Math.abs(this.noise.noise(nx*4, nz*4));
+        e = Math.pow(e, 1.4);
+        this.cache[x + z*s] = e * this.hscale;
+      }
+    }
+  }
+  heightAt(xz){
+    const half = (this.size * this.scale)*0.5;
+    const tx = (xz[0] + half) / this.scale;
+    const tz = (xz[2] + half) / this.scale;
+    const s = this.size;
+    const ix = clamp(Math.floor(tx), 0, s-2);
+    const iz = clamp(Math.floor(tz), 0, s-2);
+    const fx = tx - ix, fz = tz - iz;
+    const a = this.cache[ix + iz*s], b = this.cache[ix+1 + iz*s];
+    const c = this.cache[ix + (iz+1)*s], d = this.cache[ix+1 + (iz+1)*s];
+    const h = lerp( lerp(a,b,fx), lerp(c,d,fx), fz );
+    return h;
+  }
+  normalAt(xz){
+    const eps = 0.5;
+    const hL = this.heightAt([xz[0]-eps,0,xz[2]]);
+    const hR = this.heightAt([xz[0]+eps,0,xz[2]]);
+    const hD = this.heightAt([xz[0],0,xz[2]-eps]);
+    const hU = this.heightAt([xz[0],0,xz[2]+eps]);
+    const n = Vec3.normalize([hL - hR, 2*eps, hD - hU]);
+    return n;
+  }
+}
+
+// -------------------- Rigid body --------------------
+class RigidBody {
+  constructor(opts){
+    this.position = opts.position || [0,0,0];
+    this.orientation = opts.orientation || [1,0,0,0];
+    this.mass = opts.mass || 1;
+    this.invMass = this.mass > 0 ? 1/this.mass : 0;
+    this.linearMomentum = [0,0,0];
+    this.angularMomentum = [0,0,0];
+    this.force = [0,0,0];
+    this.torque = [0,0,0];
+    this.restitution = opts.restitution ?? 0.0;
+    this.friction = opts.friction ?? 0.6;
+    this.isKinematic = !!opts.kinematic;
+    this.shape = opts.shape || 'box';
+    if(this.shape === 'box'){
+      this.halfExtents = opts.halfExtents || [0.5,0.5,0.5];
+      const [x,y,z] = [this.halfExtents[0]*2,this.halfExtents[1]*2,this.halfExtents[2]*2];
+      const ix = (1/12) * this.mass * (y*y + z*z);
+      const iy = (1/12) * this.mass * (x*x + z*z);
+      const iz = (1/12) * this.mass * (x*x + y*y);
+      this.inertiaBody = [[ix,0,0],[0,iy,0],[0,0,iz]];
+    } else if(this.shape === 'capsule'){
+      this.radius = opts.radius || 0.4;
+      this.height = opts.height || 1.2;
+      const r = this.radius, h = Math.max(0, this.height - 2*r);
+      const cylMass = this.mass * (h * Math.PI * r*r) / (h*Math.PI*r*r + (4/3)*Math.PI*r*r*r);
+      const sphereMass = (this.mass - cylMass)/2;
+      const ix = (1/12)*cylMass*(3*r*r + h*h) + (2/5)*sphereMass*r*r + sphereMass*( (h/2 + 3*r/8)**2 );
+      const iz = ix;
+      const iy = 0.5*cylMass*r*r + (2/5)*sphereMass*r*r;
+      this.inertiaBody = [[ix,0,0],[0,iy,0],[0,0,iz]];
+    }
+    this.invInertiaBody = mat3Inverse(this.inertiaBody);
+    this.angularVelocity = [0,0,0];
+    this.linearVelocity = [0,0,0];
+    this.mesh = null;
+  }
+
+  worldSpaceInertiaInverse(){
+    const R = quatToMat3(this.orientation);
+    return mat3Mul(R, mat3Mul(this.invInertiaBody, mat3Transpose(R)));
+  }
+
+  applyForce(f){ this.force = Vec3.add(this.force, f); }
+  applyTorque(t){ this.torque = Vec3.add(this.torque, t); }
+  applyImpulse(posWorld, impulse){
+    if(this.isKinematic) return;
+    this.linearMomentum = Vec3.add(this.linearMomentum, Vec3.scale(impulse,1));
+    const r = Vec3.sub(posWorld, this.position);
+    const ang = Vec3.cross(r, impulse);
+    this.angularMomentum = Vec3.add(this.angularMomentum, ang);
+    this.updateDerived();
+  }
+
+  updateDerived(){
+    this.linearVelocity = Vec3.scale(this.linearMomentum, this.invMass);
+    const invI = this.worldSpaceInertiaInverse();
+    this.angularVelocity = mat3MulVec(invI, this.angularMomentum);
+  }
+
+  integrateVelocities(dt){
+    if(this.isKinematic) return;
+    this.linearMomentum = Vec3.add(this.linearMomentum, Vec3.scale(this.force, dt));
+    this.angularMomentum = Vec3.add(this.angularMomentum, Vec3.scale(this.torque, dt));
+    this.updateDerived();
+    this.position = Vec3.add(this.position, Vec3.scale(this.linearVelocity, dt));
+    const w = this.angularVelocity;
+    const omegaQuat = [0, w[0], w[1], w[2]];
+    const dq = quatMul(omegaQuat, this.orientation).map(v=>v*0.5*dt);
+    this.orientation = quatNormalize([
+      this.orientation[0] + dq[0],
+      this.orientation[1] + dq[1],
+      this.orientation[2] + dq[2],
+      this.orientation[3] + dq[3]
+    ]);
+    this.force = [0,0,0];
+    this.torque = [0,0,0];
+  }
+}
+
+// -------------------- Small matrix helpers --------------------
+function quatToMat3(q){
+  const w=q[0], x=q[1], y=q[2], z=q[3];
+  const xx = x*x, yy=y*y, zz=z*z, xy=x*y, xz=x*z, yz=y*z, wx=w*x, wy=w*y, wz=w*z;
+  return [
+    [1-2*(yy+zz), 2*(xy-wz),   2*(xz+wy)],
+    [2*(xy+wz),   1-2*(xx+zz), 2*(yz-wx)],
+    [2*(xz-wy),   2*(yz+wx),   1-2*(xx+yy)]
+  ];
+}
+function mat3Transpose(m){ return [[m[0][0],m[1][0],m[2][0]],[m[0][1],m[1][1],m[2][1]],[m[0][2],m[1][2],m[2][2]]]; }
+function mat3Mul(a,b){
+  const out = [[0,0,0],[0,0,0],[0,0,0]];
+  for(let i=0;i<3;i++) for(let j=0;j<3;j++) for(let k=0;k<3;k++) out[i][j]+=a[i][k]*b[k][j];
+  return out;
+}
+function mat3MulVec(m,v){ return [ m[0][0]*v[0]+m[0][1]*v[1]+m[0][2]*v[2], m[1][0]*v[0]+m[1][1]*v[1]+m[1][2]*v[2], m[2][0]*v[0]+m[2][1]*v[1]+m[2][2]*v[2] ]; }
+function mat3Inverse(m){
+  const a = m[0][0], b=m[0][1], c=m[0][2], d=m[1][0], e=m[1][1], f=m[1][2], g=m[2][0], h=m[2][1], i=m[2][2];
+  const A = e*i - f*h, B = c*h - b*i, C = b*f - c*e;
+  const det = a*A + d*B + g*C;
+  if(Math.abs(det) < 1e-9) return [[0,0,0],[0,0,0],[0,0,0]];
+  const invDet = 1/det;
+  return [
+    [ A*invDet, (c*g - a*i)*invDet, (a*h - b*g)*invDet ],
+    [ B*invDet, (a*i - c*g)*invDet, (b*g - a*h)*invDet ],
+    [ C*invDet, (b*f - c*e)*invDet, (c*e - b*f)*invDet ]
+  ];
+}
+
+// -------------------- Physics world --------------------
+class PhysicsWorld {
+  constructor(){
+    this.bodies = [];
+    this.gravity = [0, -9.81, 0];
+    this.solverIterations = 6;
+    this.dt = 1/120; // fixed step
+    this.cellSize = 2.5;
+    this.spatial = new Map();
+    this.terrain = null;
+  }
+  addBody(b){ this.bodies.push(b); }
+  removeBody(b){ this.bodies = this.bodies.filter(x=>x!==b); }
+
+  step(){
+    const dt = this.dt;
+    for(const b of this.bodies){
+      if(b.isKinematic) continue;
+      b.applyForce(Vec3.scale(this.gravity, b.mass));
+      const damp = 0.995;
+      b.linearMomentum = Vec3.scale(b.linearMomentum, damp);
+      b.angularMomentum = Vec3.scale(b.angularMomentum, damp);
+    }
+    for(const b of this.bodies) b.integrateVelocities(dt);
+
+    const contacts = [];
+    for(const b of this.bodies){
+      if(this.terrain){
+        if(b.shape === 'box'){
+          const ext = b.halfExtents;
+          const cornersLocal = [
+            [ ext[0], ext[1], ext[2] ],[ -ext[0], ext[1], ext[2] ],
+            [ ext[0], -ext[1], ext[2] ],[ -ext[0], -ext[1], ext[2] ],
+            [ ext[0], ext[1], -ext[2] ],[ -ext[0], ext[1], -ext[2] ],
+            [ ext[0], -ext[1], -ext[2] ],[ -ext[0], -ext[1], -ext[2] ]
+          ];
+          // also sample face centers for more stable contacts
+          const faceCenters = [
+            [ ext[0], 0, 0 ],[ -ext[0], 0, 0 ],
+            [0, ext[1], 0],[0, -ext[1], 0],
+            [0,0, ext[2]],[0,0, -ext[2]]
+          ];
+          for(const c of cornersLocal.concat(faceCenters)){
+            const worldP = Vec3.add(b.position, quatRotateVec(b.orientation, c));
+            const terrainH = this.terrain.heightAt(worldP);
+            const penetration = terrainH - worldP[1];
+            if(penetration > -0.01){
+              const normal = this.terrain.normalAt(worldP);
+              contacts.push({a: b, b:null, pos:worldP, normal, penetration, type:'terrain'});
+            }
+          }
+        } else if(b.shape === 'capsule'){
+          const topWorld = Vec3.add(b.position, quatRotateVec(b.orientation, [0, b.height*0.5 - b.radius, 0]));
+          const botWorld = Vec3.add(b.position, quatRotateVec(b.orientation, [0, -b.height*0.5 + b.radius, 0]));
+          for(const center of [botWorld, topWorld]){
+            const terrainH = this.terrain.heightAt(center);
+            const penetration = terrainH - (center[1] - b.radius);
+            if(penetration > -0.01){
+              const normal = this.terrain.normalAt(center);
+              const contactPoint = [center[0], terrainH, center[2]];
+              contacts.push({a:b, b:null, pos:contactPoint, normal, penetration, type:'terrain'});
+            }
+          }
+        }
+      }
+    }
+
+    // pairwise collisions including capsule-box
+    const n = this.bodies.length;
+    for(let i=0;i<n;i++){
+      const A = this.bodies[i];
+      for(let j=i+1;j<n;j++){
+        const B = this.bodies[j];
+        if(A === B) continue;
+
+        // box-box
+        if(A.shape === 'box' && B.shape === 'box'){
+          const res = obbVsObb(A,B);
+          if(res){
+            contacts.push({a:A, b:B, pos: res.point, normal: res.normal, penetration: res.penetration, type:'body'});
+          }
+          continue;
+        }
+
+        // capsule (player) vs box (both orders)
+        if(A.shape === 'capsule' && B.shape === 'box'){
+          const c = capsuleVsBox(A, B);
+          if(c) contacts.push(c);
+          continue;
+        }
+        if(A.shape === 'box' && B.shape === 'capsule'){
+          const c = capsuleVsBox(B, A);
+          if(c){
+            // capsuleVsBox returns {a:capsule, b:box, ...}
+            // We want the contact with a=A, b=B so solver sees A as box and B as capsule OR it's fine either way.
+            // Keep as returned (a: capsule, b: box) — solver handles either, but ensure normal points from a->b.
+            // To keep consistent with other body contacts (a,b) we will swap so a=A, b=B
+            // c.pos is the world closest point on the box; flip normal to point from A->B
+            const flipped = {
+              a: A,
+              b: B,
+              pos: c.pos,
+              normal: Vec3.scale(c.normal, -1), // invert so it points from A->B
+              penetration: c.penetration,
+              type: 'body'
+            };
+            contacts.push(flipped);
+          }
+          continue;
+        }
+
+        // capsule-capsule could be added here (not needed right now)
+      }
+    }
+
+    // velocity-level impulse solver
+    for(let iter=0; iter<this.solverIterations; iter++){
+      for(const c of contacts){
+        if(c.type === 'terrain'){
+          const A = c.a;
+          const rA = Vec3.sub(c.pos, A.position);
+          const vA = Vec3.add(A.linearVelocity, Vec3.cross(A.angularVelocity, rA));
+          const vRel = vA;
+          const vn = Vec3.dot(vRel, c.normal);
+          const baum = Math.max(0, c.penetration) * 0.2 / this.dt;
+          const e = A.restitution;
+          const raCrossN = Vec3.cross(rA, c.normal);
+          const invIA = mat3MulVec(A.worldSpaceInertiaInverse(), raCrossN);
+          const k = A.invMass + Vec3.dot(raCrossN, invIA);
+          if(k <= 0) continue;
+          const jn = -(vn*(1+e) + baum) / k;
+          const jnClamped = Math.max(jn, 0);
+          const impulseN = Vec3.scale(c.normal, jnClamped);
+          A.applyImpulse(c.pos, impulseN.map(x=>x));
+          const vA2 = Vec3.add(A.linearVelocity, Vec3.cross(A.angularVelocity, rA));
+          const vt = Vec3.sub(vA2, Vec3.scale(c.normal, Vec3.dot(vA2, c.normal)));
+          const vtLen = Vec3.length(vt);
+          if(vtLen > 1e-4){
+            const tanDir = Vec3.scale(vt, 1/vtLen);
+            const raCrossT = Vec3.cross(rA, tanDir);
+            const invIAt = mat3MulVec(A.worldSpaceInertiaInverse(), raCrossT);
+            const kt = A.invMass + Vec3.dot(raCrossT, invIAt);
+            if(kt>0){
+              const jf = -Vec3.dot(vA2, tanDir)/kt;
+              const maxF = A.friction * jnClamped;
+              const jfClamped = clamp(jf, -maxF, maxF);
+              const impulseT = Vec3.scale(tanDir, jfClamped);
+              A.applyImpulse(c.pos, impulseT);
+            }
+          }
+        } else if(c.type === 'body'){
+          const A = c.a, B = c.b;
+          const rA = Vec3.sub(c.pos, A.position);
+          const rB = Vec3.sub(c.pos, B.position);
+          const vA = Vec3.add(A.linearVelocity, Vec3.cross(A.angularVelocity, rA));
+          const vB = Vec3.add(B.linearVelocity, Vec3.cross(B.angularVelocity, rB));
+          const vRel = Vec3.sub(vA, vB);
+          const vn = Vec3.dot(vRel, c.normal);
+          const e = Math.min(A.restitution, B.restitution);
+          const baum = Math.max(0, c.penetration) * 0.2 / this.dt;
+          const raCrossN = Vec3.cross(rA, c.normal);
+          const rbCrossN = Vec3.cross(rB, c.normal);
+          const invIA = mat3MulVec(A.worldSpaceInertiaInverse(), raCrossN);
+          const invIB = mat3MulVec(B.worldSpaceInertiaInverse(), rbCrossN);
+          const k = A.invMass + B.invMass + Vec3.dot(raCrossN, invIA) + Vec3.dot(rbCrossN, invIB);
+          if(k<=0) continue;
+          const jn = -(vn*(1+e) + baum)/k;
+          const jnClamped = Math.max(jn, 0);
+          const impulseN = Vec3.scale(c.normal, jnClamped);
+          A.applyImpulse(c.pos, impulseN);
+          B.applyImpulse(c.pos, Vec3.scale(impulseN, -1));
+          const vA2 = Vec3.add(A.linearVelocity, Vec3.cross(A.angularVelocity, rA));
+          const vB2 = Vec3.add(B.linearVelocity, Vec3.cross(B.angularVelocity, rB));
+          const vt = Vec3.sub( Vec3.sub(vA2, vB2), Vec3.scale(c.normal, Vec3.dot(Vec3.sub(vA2, vB2), c.normal)) );
+          const vtLen = Vec3.length(vt);
+          if(vtLen > 1e-4){
+            const tanDir = Vec3.scale(vt, 1/vtLen);
+            const raCrossT = Vec3.cross(rA, tanDir);
+            const rbCrossT = Vec3.cross(rB, tanDir);
+            const invIAt = mat3MulVec(A.worldSpaceInertiaInverse(), raCrossT);
+            const invIBt = mat3MulVec(B.worldSpaceInertiaInverse(), rbCrossT);
+            const kt = A.invMass + B.invMass + Vec3.dot(raCrossT, invIAt) + Vec3.dot(rbCrossT, invIBt);
+            if(kt>0){
+              const jf = -Vec3.dot(Vec3.sub(vA2,vB2), tanDir)/kt;
+              const maxF = Math.sqrt(A.friction*B.friction) * jnClamped;
+              const jfClamped = clamp(jf, -maxF, maxF);
+              const impulseT = Vec3.scale(tanDir, jfClamped);
+              A.applyImpulse(c.pos, impulseT);
+              B.applyImpulse(c.pos, Vec3.scale(impulseT,-1));
+            }
+          }
+        }
+      }
+    } // solver iters
+
+    // positional correction to remove residual penetration
+    for (const c of contacts) {
+      if (c.penetration <= 1e-4) continue;
+      if (c.type === 'terrain') {
+        const A = c.a;
+        if (A.isKinematic) continue;
+        const corr = Math.min(c.penetration + 0.001, 0.2);
+        A.position = Vec3.add(A.position, Vec3.scale(c.normal, corr));
+        const vn = Vec3.dot(A.linearVelocity, c.normal);
+        if (vn < 0) {
+          A.linearMomentum = Vec3.sub(A.linearMomentum, Vec3.scale(c.normal, vn * A.mass));
+        }
+      } else if (c.type === 'body') {
+        const A = c.a, B = c.b;
+        if (A.isKinematic && B.isKinematic) continue;
+        const totalInv = A.invMass + B.invMass;
+        if (totalInv <= 0) continue;
+        const corrTotal = Math.min((c.penetration / totalInv) * 0.8, 0.2);
+        if (!A.isKinematic) A.position = Vec3.add(A.position, Vec3.scale(c.normal, corrTotal * A.invMass));
+        if (!B.isKinematic) B.position = Vec3.add(B.position, Vec3.scale(c.normal, -corrTotal * B.invMass));
+        const vna = Vec3.dot(A.linearVelocity, c.normal);
+        const vnb = Vec3.dot(B.linearVelocity, c.normal);
+        if (vna < 0) A.linearMomentum = Vec3.sub(A.linearMomentum, Vec3.scale(c.normal, vna * A.mass));
+        if (vnb > 0) B.linearMomentum = Vec3.sub(B.linearMomentum, Vec3.scale(c.normal, vnb * B.mass));
+      }
+    }
+
+    for(const b of this.bodies) b.updateDerived();
+    return contacts.length;
+  }
+}
+
+// --- OBB vs OBB using full SAT, stable and correct ---
+function obbVsObb(A, B) {
+    const aExt = A.halfExtents;
+    const bExt = B.halfExtents;
+
+    const RA = quatToMat3(A.orientation);
+    const RB = quatToMat3(B.orientation);
+
+    const R = [ [0,0,0], [0,0,0], [0,0,0] ];
+    const AbsR = [ [0,0,0], [0,0,0], [0,0,0] ];
+
+    for (let i=0;i<3;i++) {
+        for (let j=0;j<3;j++) {
+            // R[i][j] = dot(A's axis i, B's axis j)
+            R[i][j] = RA[i][0]*RB[j][0] + RA[i][1]*RB[j][1] + RA[i][2]*RB[j][2];
+            AbsR[i][j] = Math.abs(R[i][j]) + 1e-6;
+        }
+    }
+
+    let t = Vec3.sub(B.position, A.position);
+    t = [
+        Vec3.dot(t, [RA[0][0],RA[0][1],RA[0][2]]),
+        Vec3.dot(t, [RA[1][0],RA[1][1],RA[1][2]]),
+        Vec3.dot(t, [RA[2][0],RA[2][1],RA[2][2]])
+    ];
+
+    let minOverlap = Infinity;
+    let bestNormal = null;
+
+    function testAxis(axis, overlap, flip) {
+        if (overlap < minOverlap) {
+            minOverlap = overlap;
+            bestNormal = axis.slice();
+            if (flip) bestNormal = Vec3.scale(bestNormal, -1);
+        }
+    }
+
+    for (let i=0;i<3;i++) {
+        const ra = aExt[i];
+        const rb = bExt[0]*AbsR[i][0] + bExt[1]*AbsR[i][1] + bExt[2]*AbsR[i][2];
+        const dist = Math.abs(t[i]);
+        const overlap = ra + rb - dist;
+        if (overlap <= 0) return null;
+        const axis = [RA[i][0], RA[i][1], RA[i][2]];
+        testAxis(axis, overlap, t[i] < 0);
+    }
+
+    for (let j=0;j<3;j++) {
+        const ra = bExt[j];
+        const rb = aExt[0]*AbsR[0][j] + aExt[1]*AbsR[1][j] + aExt[2]*AbsR[2][j];
+        const dist = Math.abs(t[0]*R[0][j] + t[1]*R[1][j] + t[2]*R[2][j]);
+        const overlap = ra + rb - dist;
+        if (overlap <= 0) return null;
+        const axis = [RB[j][0], RB[j][1], RB[j][2]];
+        testAxis(axis, overlap, dist < 0);
+    }
+
+    for (let i=0;i<3;i++) {
+        for (let j=0;j<3;j++) {
+            const axis = Vec3.cross(
+                [RA[i][0], RA[i][1], RA[i][2]],
+                [RB[j][0], RB[j][1], RB[j][2]]
+            );
+            const L = Vec3.length(axis);
+            if (L < 1e-6) continue;
+            const n = Vec3.scale(axis, 1/L);
+
+            const ra = 
+                aExt[(i+1)%3] * AbsR[(i+1)%3][j] +
+                aExt[(i+2)%3] * AbsR[(i+2)%3][j];
+
+            const rb =
+                bExt[(j+1)%3] * AbsR[i][(j+1)%3] +
+                bExt[(j+2)%3] * AbsR[i][(j+2)%3];
+
+            const dist = Math.abs(t[0]*n[0] + t[1]*n[1] + t[2]*n[2]);
+            const overlap = ra + rb - dist;
+            if (overlap <= 0) return null;
+
+            testAxis(n, overlap, Vec3.dot(n, t) < 0);
+        }
+    }
+
+    if(!bestNormal) return null;
+    bestNormal = Vec3.normalize(bestNormal);
+
+    // compute approximate contact point: midpoint of closest approach along normal between centers
+    const centerDiff = Vec3.sub(B.position, A.position);
+    const projected = Vec3.dot(centerDiff, bestNormal);
+    const mid = Vec3.add(A.position, Vec3.scale(bestNormal, projected * 0.5));
+    return {
+        normal: bestNormal,
+        penetration: minOverlap,
+        point: mid
+    };
+}
+
+// closest point from capsule center-line to an OBB
+function capsuleVsBox(player, box) {
+    const RA = quatToMat3(box.orientation);
+
+    const top = Vec3.add(
+        player.position,
+        quatRotateVec(player.orientation, [0, player.height/2 - player.radius, 0])
+    );
+    const bottom = Vec3.add(
+        player.position,
+        quatRotateVec(player.orientation, [0, -player.height/2 + player.radius, 0])
+    );
+
+    // check multiple sample points along the capsule segment for stability
+    const segPoints = [bottom, top, Vec3.scale(Vec3.add(bottom, top), 0.5)];
+    for (const p of segPoints) {
+        const rel = Vec3.sub(p, box.position);
+        const local = [
+            Vec3.dot(rel, [RA[0][0],RA[0][1],RA[0][2]]),
+            Vec3.dot(rel, [RA[1][0],RA[1][1],RA[1][2]]),
+            Vec3.dot(rel, [RA[2][0],RA[2][1],RA[2][2]])
+        ];
+
+        const closest = [
+            clamp(local[0], -box.halfExtents[0], box.halfExtents[0]),
+            clamp(local[1], -box.halfExtents[1], box.halfExtents[1]),
+            clamp(local[2], -box.halfExtents[2], box.halfExtents[2])
+        ];
+
+        const cw = Vec3.add(
+            box.position,
+            [
+                closest[0]*RA[0][0] + closest[1]*RA[1][0] + closest[2]*RA[2][0],
+                closest[0]*RA[0][1] + closest[1]*RA[1][1] + closest[2]*RA[2][1],
+                closest[0]*RA[0][2] + closest[1]*RA[1][2] + closest[2]*RA[2][2]
+            ]
+        );
+
+        const d = Vec3.sub(p, cw);
+        const dist = Vec3.length(d);
+        const pen = player.radius - dist;
+
+        if (pen > 0) {
+            const n = dist > 0 ? Vec3.scale(d, 1/dist) : [0,1,0];
+            return {
+                a: player,
+                b: box,
+                pos: cw,
+                normal: n,
+                penetration: pen,
+                type: "body"
+            };
+        }
+    }
+
+    return null;
+}
+
+function obbCornersWorld(body){
+  const e = body.halfExtents;
+  const corners = [
+    [ e[0], e[1], e[2] ],[ -e[0], e[1], e[2] ],
+    [ e[0], -e[1], e[2] ],[ -e[0], -e[1], e[2] ],
+    [ e[0], e[1], -e[2] ],[ -e[0], e[1], -e[2] ],
+    [ e[0], -e[1], -e[2] ],[ -e[0], -e[1], -e[2] ]
+  ];
+  return corners.map(c => Vec3.add(body.position, quatRotateVec(body.orientation, c)));
+}
+
+// -------------------- Player controller (obround / capsule style) --------------------
+class PlayerController {
+  constructor(world, camera){
+    this.world = world;
+    this.cam = camera;
+    this.body = new RigidBody({shape:'capsule', mass:80, radius:0.35, height:1.8, restitution:0.0, friction:0.9});
+    this.body.position = [0, 10, 0];
+    this.body.isKinematic = false;
+    this.world.addBody(this.body);
+    this.input = { forward:0, right:0, jump:false, sprint:false, crouch:false };
+    this.stamina = 1.0;
+    this.maxSpeed = 6.0;
+    this.sprintMultiplier = 1.8;
+    this.staminaDrain = 0.9;
+    this.staminaRegen = 0.6;
+    this.grounded = false;
+    this.crouchFactor = 1.0;
+  }
+
+  update(dt){
+    const camDir = new THREE.Vector3();
+    this.cam.getWorldDirection(camDir); camDir.y = 0; camDir.normalize();
+    const camRight = new THREE.Vector3(); camRight.copy(camDir).applyAxisAngle(new THREE.Vector3(0,1,0), Math.PI/2);
+    let desired = new THREE.Vector3(0,0,0);
+    desired.addScaledVector(camDir, this.input.forward);
+    desired.addScaledVector(camRight, this.input.right);
+    if(desired.lengthSq()>1) desired.normalize();
+
+    let targetSpeed = this.maxSpeed * (this.input.sprint && this.stamina>0 ? this.sprintMultiplier : 1);
+    const crouch = this.input.crouch ? 0.5 : 1.0;
+    targetSpeed *= crouch;
+    desired.multiplyScalar(targetSpeed);
+
+    const lv = new THREE.Vector3(...this.body.linearVelocity);
+    const horizV = new THREE.Vector3(lv.x,0,lv.z);
+    const speedDiff = new THREE.Vector3().subVectors(desired, horizV);
+    const accel = 120;
+    const force = [speedDiff.x * this.body.mass * accel, 0, speedDiff.z * this.body.mass * accel];
+    this.body.applyForce(force);
+
+    this.grounded = false;
+    if(this.world.terrain){
+      const base = [this.body.position[0], this.body.position[1] - (this.body.height*0.5), this.body.position[2]];
+      const terrainH = this.world.terrain.heightAt(base);
+      const footY = base[1] - this.body.radius;
+      if(footY <= terrainH + 0.05){
+        this.grounded = true;
+        if(footY < terrainH + 0.01) {
+          this.body.position[1] += (terrainH + 0.01) - footY;
+          this.body.linearMomentum[1] = Math.max(0, this.body.linearMomentum[1]);
+          this.body.updateDerived();
+        }
+      }
+    }
+
+    if(this.input.jump && this.grounded){
+      const jumpImpulse = [0, this.body.mass * 5.5, 0];
+      this.body.applyImpulse(this.body.position, jumpImpulse);
+    }
+
+    if(this.input.sprint && (Math.abs(this.input.forward) > 0.1 || Math.abs(this.input.right)>0.1) && this.stamina>0){
+      this.stamina = clamp(this.stamina - this.staminaDrain*dt, 0, 1);
+    } else {
+      this.stamina = clamp(this.stamina + this.staminaRegen*dt, 0, 1);
+    }
+
+    this.crouchFactor = lerp(this.crouchFactor, this.input.crouch ? 0.6 : 1.0, 0.1);
+    this.body.height = 1.8 * this.crouchFactor;
+    if(this.input.crouch) this.body.linearMomentum[0] *= 0.98, this.body.linearMomentum[2] *= 0.98;
+  }
+}
+
+// -------------------- Renderer + Scene Setup --------------------
+let scene, camera, renderer, world, terrainMesh;
+init();
+function init(){
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.1, 1000);
+  camera.position.set(0,2,6);
+  renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.appendChild(renderer.domElement);
+
+  scene.add(new THREE.AmbientLight(0xffffff,0.5));
+  const dir = new THREE.DirectionalLight(0xffffff,0.9); dir.position.set(5,10,3); scene.add(dir);
+
+  world = new PhysicsWorld();
+  world.terrain = new Terrain(256, 1.0, 8.5, Math.floor(Math.random()*100000));
+  const size = world.terrain.size;
+  const geom = new THREE.PlaneGeometry(size * world.terrain.scale, size * world.terrain.scale, size-1, size-1);
+  geom.rotateX(-Math.PI/2);
+  for(let i=0;i<geom.attributes.position.count;i++){
+    const px = geom.attributes.position.getX(i);
+    const pz = geom.attributes.position.getZ(i);
+    const h = world.terrain.heightAt([px,0,pz]);
+    geom.attributes.position.setY(i, h);
+  }
+  geom.computeVertexNormals();
+  const mat = new THREE.MeshStandardMaterial({color:0x7fb97f, metalness:0.1, roughness:0.9});
+  terrainMesh = new THREE.Mesh(geom, mat);
+  scene.add(terrainMesh);
+
+  for(let i=0;i<40;i++){
+    const x = (Math.random()-0.5) * 60;
+    const z = (Math.random()-0.5) * 60;
+    const y = world.terrain.heightAt([x,0,z]) + 4 + Math.random()*6;
+    createBox([x,y,z], [Math.random()*2+0.3, Math.random()*2+0.3, Math.random()*2+0.3], Math.random()*20+0.5);
+  }
+
+  player = new PlayerController(world, camera);
+  const cylGeo = new THREE.CylinderGeometry(player.body.radius, player.body.radius, player.body.height - 2*player.body.radius, 12);
+  const sphGeo = new THREE.SphereGeometry(player.body.radius, 12, 12);
+  const pMat = new THREE.MeshStandardMaterial({color:0x3366ff});
+  const cyl = new THREE.Mesh(cylGeo, pMat);
+  const sTop = new THREE.Mesh(sphGeo, pMat); const sBot = new THREE.Mesh(sphGeo, pMat);
+  const playerGroup = new THREE.Group();
+  cyl.position.y = 0;
+  sTop.position.y = (player.body.height/2 - player.body.radius);
+  sBot.position.y = -(player.body.height/2 - player.body.radius);
+  playerGroup.add(cyl); playerGroup.add(sTop); playerGroup.add(sBot);
+  scene.add(playerGroup);
+  player.body.mesh = playerGroup;
+
+  renderer.setClearColor(0xa0d8ff);
+
+  camera.position.set(0, 1.8, 5);
+
+  setupInput();
+
+  document.getElementById('count').innerText = world.bodies.length;
+
+  lastTime = performance.now()/1000;
+  accumulator = 0;
+  animate();
+}
+
+function createBox(position, size, mass){
+  const b = new RigidBody({shape:'box', mass: mass, halfExtents: [size[0]/2, size[1]/2, size[2]/2], restitution:0.0, friction:0.6});
+  b.position = position.slice();
+  const angle = Math.random()*Math.PI*2;
+  b.orientation = quatNormalize([Math.cos(angle/2), Math.sin(angle/2), 0, 0]);
+  b.angularMomentum = [Math.random()*0.01, Math.random()*0.1, Math.random()*0.01];
+  const geo = new THREE.BoxGeometry(size[0], size[1], size[2]);
+  const mat = new THREE.MeshStandardMaterial({color:0x8b6b4b});
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.castShadow = true;
+  mesh.position.set(...b.position);
+  mesh.quaternion.set(b.orientation[0], b.orientation[1], b.orientation[2], b.orientation[3]);
+  scene.add(mesh);
+  b.mesh = mesh;
+  world.addBody(b);
+  return b;
+}
+
+// -------------------- Input handling --------------------
+function setupInput(){
+  window.addEventListener('keydown', e=>{ keys[e.code]=true; if(e.code==='Space') e.preventDefault(); });
+  window.addEventListener('keyup', e=>{ keys[e.code]=false; });
+  renderer.domElement.addEventListener('click', ()=> renderer.domElement.requestPointerLock());
+  document.addEventListener('pointerlockchange', ()=> {
+    if(document.pointerLockElement === renderer.domElement){
+      document.addEventListener('mousemove', onMouseMove);
+    } else {
+      document.removeEventListener('mousemove', onMouseMove);
+    }
+  });
+}
+let yaw = 0, pitch = 0;
+function onMouseMove(e){
+  const sens = 0.002;
+  yaw -= e.movementX * sens;
+  pitch -= e.movementY * sens;
+  pitch = clamp(pitch, -Math.PI/2+0.1, Math.PI/2-0.1);
+  camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
+}
+
+// -------------------- Main loop: fixed step sim + render --------------------
+function animate(){
+  requestAnimationFrame(animate);
+  const t = performance.now()/1000;
+  let dt = t - lastTime; if(dt>0.1) dt = 0.1;
+  lastTime = t;
+  accumulator += dt;
+
+  if(player){
+    player.input.forward = (keys['KeyW']?1:0) + (keys['KeyS']?-1:0);
+    player.input.right   = (keys['KeyD']?-1:0) + (keys['KeyA']?1:0);
+    player.input.jump = !!keys['Space'];
+    player.input.sprint = !!keys['ShiftLeft'] || !!keys['ShiftRight'];
+    player.input.crouch = !!keys['ControlLeft'] || !!keys['ControlRight'];
+  }
+
+  while(accumulator >= world.dt){
+    player.update(world.dt);
+    const count = world.step();
+    accumulator -= world.dt;
+  }
+
+  for(const b of world.bodies){
+    if(!b.mesh) continue;
+    b.mesh.position.set(b.position[0], b.position[1], b.position[2]);
+    b.mesh.quaternion.set(b.orientation[1], b.orientation[2], b.orientation[3], b.orientation[0]);
+  }
+  if(player){
+    const ppos = new THREE.Vector3(...player.body.position);
+    const camOffset = new THREE.Vector3(0, player.body.height*0.45, 0);
+    camera.position.copy(ppos).add(camOffset).add(new THREE.Vector3(0,0,0));
+  }
+
+  renderer.render(scene, camera);
+
+  document.getElementById('staminaInner').style.width = `${player.stamina*100}%`;
+  document.getElementById('fps').innerText = Math.round(1/(Math.max(1e-6, t - fpsCounter.last)));
+  fpsCounter.last = t;
+}
+
+// -------------------- End --------------------
+</script>
+</body>
+</html>
